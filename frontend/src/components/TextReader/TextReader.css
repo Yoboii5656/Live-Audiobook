@@ -1,0 +1,129 @@
+.text-reader {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: white;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.text-reader-header {
+  padding: 1.5rem;
+  border-bottom: 1px solid #e5e7eb;
+  background: linear-gradient(to bottom, #ffffff, #f9fafb);
+}
+
+.text-reader-header h3 {
+  margin: 0 0 0.5rem 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #1f2937;
+}
+
+.text-reader-hint {
+  margin: 0;
+  font-size: 0.875rem;
+  color: #6b7280;
+}
+
+.text-reader-content {
+  flex: 1;
+  padding: 2rem;
+  overflow-y: auto;
+  scroll-behavior: smooth;
+}
+
+.text-content {
+  font-size: 1.125rem;
+  line-height: 2;
+  color: #1f2937;
+  font-family: 'Georgia', 'Times New Roman', serif;
+  text-align: justify;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.text-word {
+  cursor: pointer;
+  padding: 2px 1px;
+  border-radius: 3px;
+  transition: all 0.2s ease;
+  position: relative;
+}
+
+.text-word:hover {
+  background-color: #e0f2fe;
+  color: #0369a1;
+}
+
+.text-word-active {
+  background-color: #fbbf24;
+  color: #78350f;
+  font-weight: 600;
+  animation: pulse 0.5s ease;
+  box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.3);
+}
+
+@keyframes pulse {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.02);
+  }
+}
+
+.text-spacing {
+  white-space: pre-wrap;
+}
+
+/* Scrollbar styling */
+.text-reader-content::-webkit-scrollbar {
+  width: 8px;
+}
+
+.text-reader-content::-webkit-scrollbar-track {
+  background: #f1f5f9;
+  border-radius: 4px;
+}
+
+.text-reader-content::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+.text-reader-content::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Selection styling */
+.text-word::selection,
+.text-spacing::selection {
+  background-color: #bfdbfe;
+  color: #1e40af;
+}
+
+/* Mobile responsiveness */
+@media (max-width: 768px) {
+  .text-reader-content {
+    padding: 1.5rem;
+  }
+
+  .text-content {
+    font-size: 1rem;
+    line-height: 1.8;
+  }
+
+  .text-reader-header {
+    padding: 1rem;
+  }
+
+  .text-reader-header h3 {
+    font-size: 1.125rem;
+  }
+
+  .text-reader-hint {
+    font-size: 0.8125rem;
+  }
+}
