@@ -22,9 +22,10 @@
 
 .pdf-viewer-content {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 32px 0;
-  scroll-behavior: smooth;
+  position: relative;
 }
 
 .pdf-page-container {

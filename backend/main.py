@@ -7,7 +7,11 @@ app = FastAPI(title="AI Audiobook Reader API")
 # CORS configuration for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Vite default port
+    allow_origins=[
+        "http://localhost:5173",  # Vite default port
+        "http://localhost:5174",  # Vite alternate port
+        "http://localhost:3000",  # Alternative dev port
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

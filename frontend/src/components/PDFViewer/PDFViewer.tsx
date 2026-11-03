@@ -15,24 +15,40 @@ interface PDFViewerProps {
   currentPage?: number
 }
 
+const RENDER_SCALE = 1.5
+// How long to ignore scroll-based page detection after a programmatic jump
+const PROGRAMMATIC_SCROLL_LOCK_MS = 1000
+
 export default function PDFViewer({ pdfUrl, pdfFile, onPageChange, currentPage = 1 }: PDFViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null)
   const [totalPages, setTotalPages] = useState(0)
-  const [visiblePage, setVisiblePage] = useState(1)
+  const [visiblePage, setVisiblePage] = useState(currentPage)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const pageRefs = useRef<Map<number, HTMLCanvasElement>>(new Map())
+  // Incremented once all page placeholders exist in the DOM
+  const [layoutVersion, setLayoutVersion] = useState(0)
+
+  const renderedPagesRef = useRef<Set<number>>(new Set())
+  const renderingPagesRef = useRef<Set<number>>(new Set())
+  const scrollLockUntilRef = useRef(0)
+  // Last page we reported to (or received from) the parent.
+  // Starts at 0 so the first layout always scrolls to the starting page.
+  const lastKnownPageRef = useRef(0)
+  // Keep the latest callback without re-subscribing observers on every render
+  const onPageChangeRef = useRef(onPageChange)
+  useEffect(() => {
+    onPageChangeRef.current = onPageChange
+  }, [onPageChange])
 
   // Load PDF document
   useEffect(() => {
+    let cancelled = false
     const loadPDF = async () => {
       setLoading(true)
       setError(null)
-
       try {
         let loadingTask
-
         if (pdfFile) {
           const arrayBuffer = await pdfFile.arrayBuffer()
           loadingTask = pdfjsLib.getDocument({ data: arrayBuffer })
@@ -41,182 +57,205 @@ export default function PDFViewer({ pdfUrl, pdfFile, onPageChange, currentPage =
         } else {
           throw new Error('No PDF source provided')
         }
-
         const pdf = await loadingTask.promise
+        if (cancelled) return
         setPdfDoc(pdf)
         setTotalPages(pdf.numPages)
         setLoading(false)
       } catch (err) {
+        if (cancelled) return
         setError(err instanceof Error ? err.message : 'Failed to load PDF')
         setLoading(false)
       }
     }
-
     loadPDF()
+    return () => {
+      cancelled = true
+    }
   }, [pdfUrl, pdfFile])
 
-  // Render all pages
+  // Create a placeholder for every page right away, so any page can be scrolled to immediately
   useEffect(() => {
-    if (!pdfDoc || !containerRef.current) return
+    const container = containerRef.current
+    if (!pdfDoc || !container) return
+    let cancelled = false
 
-    const renderPages = async () => {
+    const buildLayout = async () => {
+      const firstPage = await pdfDoc.getPage(1)
+      const viewport = firstPage.getViewport({ scale: RENDER_SCALE })
+      if (cancelled) return
+
+      container.innerHTML = ''
+      renderedPagesRef.current.clear()
+      renderingPagesRef.current.clear()
+
       for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
-        const page = await pdfDoc.getPage(pageNum)
-        const viewport = page.getViewport({ scale: 1.5 })
-
-        // Create canvas for this page
-        const canvas = document.createElement('canvas')
-        const context = canvas.getContext('2d')
-        if (!context) continue
-
-        canvas.height = viewport.height
-        canvas.width = viewport.width
-        canvas.className = 'pdf-page-canvas'
-        canvas.dataset.pageNumber = pageNum.toString()
-
-        // Create page container
         const pageContainer = document.createElement('div')
         pageContainer.className = 'pdf-page-container'
         pageContainer.dataset.pageNumber = pageNum.toString()
+        // Reserve space using the first page's aspect ratio until the real page renders
+        pageContainer.style.aspectRatio = `${viewport.width} / ${viewport.height}`
 
-        // Add page number label
         const pageLabel = document.createElement('div')
         pageLabel.className = 'pdf-page-label'
         pageLabel.textContent = `Page ${pageNum}`
-
         pageContainer.appendChild(pageLabel)
-        pageContainer.appendChild(canvas)
-        containerRef.current?.appendChild(pageContainer)
 
-        // Render page
-        await page.render({
-          canvasContext: context,
-          viewport: viewport,
-        }).promise
-
-        pageRefs.current.set(pageNum, canvas)
+        container.appendChild(pageContainer)
       }
+      setLayoutVersion((v) => v + 1)
     }
 
-    // Clear previous renders
-    if (containerRef.current) {
-      containerRef.current.innerHTML = ''
+    buildLayout()
+    return () => {
+      cancelled = true
     }
-    pageRefs.current.clear()
-
-    renderPages()
   }, [pdfDoc])
 
-  // Highlight current page
-  useEffect(() => {
-    if (!containerRef.current) return
+  // Render a single page into its placeholder
+  const renderPage = async (pageNum: number) => {
+    const container = containerRef.current
+    if (!pdfDoc || !container) return
+    if (renderedPagesRef.current.has(pageNum) || renderingPagesRef.current.has(pageNum)) return
+    renderingPagesRef.current.add(pageNum)
 
-    // Remove previous highlights
-    const allPages = containerRef.current.querySelectorAll('.pdf-page-container')
-    allPages.forEach((page) => page.classList.remove('pdf-page-current'))
+    try {
+      const page = await pdfDoc.getPage(pageNum)
+      const viewport = page.getViewport({ scale: RENDER_SCALE })
+      const pageContainer = container.querySelector<HTMLElement>(
+        `.pdf-page-container[data-page-number="${pageNum}"]`
+      )
+      if (!pageContainer) return
 
-    // Add highlight to current page
-    const currentPageContainer = containerRef.current.querySelector(
-      `.pdf-page-container[data-page-number="${currentPage}"]`
-    )
-    if (currentPageContainer) {
-      currentPageContainer.classList.add('pdf-page-current')
+      const canvas = document.createElement('canvas')
+      const context = canvas.getContext('2d')
+      if (!context) return
+      canvas.width = viewport.width
+      canvas.height = viewport.height
+      canvas.className = 'pdf-page-canvas'
+
+      await page.render({ canvasContext: context, viewport }).promise
+
+      pageContainer.style.aspectRatio = `${viewport.width} / ${viewport.height}`
+      pageContainer.appendChild(canvas)
+      renderedPagesRef.current.add(pageNum)
+    } catch (err) {
+      console.error(`Failed to render page ${pageNum}:`, err)
+    } finally {
+      renderingPagesRef.current.delete(pageNum)
     }
-  }, [currentPage])
+  }
 
-  // Track visible page on scroll
+  // Lazily render pages as they come near the viewport
   useEffect(() => {
-    if (!containerRef.current) return
+    const container = containerRef.current
+    if (!container || layoutVersion === 0) return
 
     const observer = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {
           if (entry.isIntersecting) {
-            const pageNum = parseInt(
-              (entry.target as HTMLElement).dataset.pageNumber || '1'
-            )
-            setVisiblePage(pageNum)
-            onPageChange?.(pageNum)
+            const pageNum = parseInt((entry.target as HTMLElement).dataset.pageNumber || '1')
+            renderPage(pageNum)
           }
         })
       },
-      {
-        root: null,
-        threshold: 0.5, // Page is considered visible when 50% is in view
-      }
+      { root: container, rootMargin: '1500px 0px' }
     )
-
-    // Observe all page containers
-    const pageContainers = containerRef.current.querySelectorAll('.pdf-page-container')
-    pageContainers.forEach((page) => observer.observe(page))
-
+    container.querySelectorAll('.pdf-page-container').forEach((el) => observer.observe(el))
     return () => observer.disconnect()
-  }, [pdfDoc, onPageChange])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layoutVersion])
 
-  // Scroll to specific page when currentPage changes
+  // Track which page the user has scrolled to
   useEffect(() => {
-    if (currentPage && containerRef.current) {
-      console.log(`📄 PDFViewer: Scrolling to page ${currentPage}`)
-      
-      // Use a small delay to ensure page is rendered
-      const scrollTimer = setTimeout(() => {
-        const pageContainer = containerRef.current?.querySelector(
-          `.pdf-page-container[data-page-number="${currentPage}"]`
-        )
-        if (pageContainer) {
-          pageContainer.scrollIntoView({ behavior: 'smooth', block: 'start' })
-          console.log(`✅ Scrolled to page ${currentPage}`)
-        } else {
-          console.warn(`⚠️  Page container ${currentPage} not found in DOM yet`)
-          
-          // Retry after pages are rendered
-          const retryTimer = setTimeout(() => {
-            const retryPageContainer = containerRef.current?.querySelector(
-              `.pdf-page-container[data-page-number="${currentPage}"]`
-            )
-            if (retryPageContainer) {
-              retryPageContainer.scrollIntoView({ behavior: 'smooth', block: 'start' })
-              console.log(`✅ Scrolled to page ${currentPage} (retry successful)`)
-            } else {
-              console.error(`❌ Failed to scroll to page ${currentPage} - page not rendered`)
-            }
-          }, 2000)  // Retry after 2 seconds
-          
-          return () => clearTimeout(retryTimer)
+    const container = containerRef.current
+    if (!container || layoutVersion === 0) return
+
+    let frame = 0
+    const handleScroll = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => {
+        // The page whose area covers the middle of the viewport is the visible one
+        const containerRect = container.getBoundingClientRect()
+        const middle = containerRect.top + containerRect.height / 2
+        const pages = container.querySelectorAll<HTMLElement>('.pdf-page-container')
+        let found = 0
+        for (const el of pages) {
+          const rect = el.getBoundingClientRect()
+          if (rect.top <= middle && rect.bottom >= middle) {
+            found = parseInt(el.dataset.pageNumber || '0')
+            break
+          }
         }
-      }, 500)  // Initial delay of 500ms
-      
-      return () => clearTimeout(scrollTimer)
+        if (!found) return
+        setVisiblePage(found)
+
+        // Ignore scroll events caused by our own jump to a page
+        if (Date.now() < scrollLockUntilRef.current) return
+        if (found !== lastKnownPageRef.current) {
+          lastKnownPageRef.current = found
+          onPageChangeRef.current?.(found)
+        }
+      })
     }
-  }, [currentPage, pdfDoc])
 
-  if (loading) {
-    return (
-      <div className="pdf-viewer-loading">
-        <div className="spinner"></div>
-        <p>Loading PDF...</p>
-      </div>
-    )
-  }
+    container.addEventListener('scroll', handleScroll, { passive: true })
+    return () => {
+      container.removeEventListener('scroll', handleScroll)
+      cancelAnimationFrame(frame)
+    }
+  }, [layoutVersion])
 
-  if (error) {
-    return (
-      <div className="pdf-viewer-error">
-        <p>❌ {error}</p>
-      </div>
+  // Jump to the page when it is changed from outside (buttons, input, auto-advance)
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container || layoutVersion === 0) return
+
+    // Highlight current page
+    container.querySelectorAll('.pdf-page-current').forEach((el) => el.classList.remove('pdf-page-current'))
+    const target = container.querySelector<HTMLElement>(
+      `.pdf-page-container[data-page-number="${currentPage}"]`
     )
-  }
+    if (!target) return
+    target.classList.add('pdf-page-current')
+
+    // The user scrolled here themselves; no need to move
+    if (currentPage === lastKnownPageRef.current && currentPage === visiblePage) return
+
+    const isFirstJump = lastKnownPageRef.current === 0
+    lastKnownPageRef.current = currentPage
+    scrollLockUntilRef.current = Date.now() + PROGRAMMATIC_SCROLL_LOCK_MS
+    renderPage(currentPage)
+    container.scrollTo({ top: target.offsetTop - 16, behavior: isFirstJump ? 'auto' : 'smooth' })
+    setVisiblePage(currentPage)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPage, layoutVersion])
 
   return (
     <div className="pdf-viewer">
-      <div className="pdf-viewer-header">
+      {loading && (
+        <div className="pdf-viewer-loading">
+          <div className="spinner"></div>
+          <p>Loading PDF...</p>
+        </div>
+      )}
+      {error && (
+        <div className="pdf-viewer-error">
+          <p>❌ {error}</p>
+        </div>
+      )}
+      <div className="pdf-viewer-header" style={{ display: loading || error ? 'none' : undefined }}>
         <span className="pdf-page-indicator">
           Page {visiblePage} of {totalPages}
         </span>
       </div>
-      <div className="pdf-viewer-content" ref={containerRef}>
-        {/* Pages will be rendered here */}
-      </div>
+      {/* Container stays mounted so its ref is available when the document loads */}
+      <div
+        className="pdf-viewer-content"
+        ref={containerRef}
+        style={{ display: loading || error ? 'none' : undefined }}
+      />
     </div>
   )
 }

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useMemo } from 'react'
 
 interface UsePDFTextProps {
   pages: Array<{ page: number; text: string }>
@@ -11,26 +11,16 @@ interface UsePDFTextReturn {
 }
 
 export function usePDFText({ pages, currentPage }: UsePDFTextProps): UsePDFTextReturn {
-  const [currentPageText, setCurrentPageText] = useState<string>('')
-  const [isLoading, setIsLoading] = useState<boolean>(false)
-
-  useEffect(() => {
-    setIsLoading(true)
-
-    // Find the text for the current page
-    const pageData = pages.find((p) => p.page === currentPage)
-
-    if (pageData) {
-      setCurrentPageText(pageData.text)
-    } else {
-      setCurrentPageText('')
-    }
-
-    setIsLoading(false)
-  }, [pages, currentPage])
+  // Look the text up during render so it always belongs to currentPage.
+  // Keeping it in state set by an effect left it one render behind after a page change,
+  // so auto-advance could judge a page by the previous page's text.
+  const currentPageText = useMemo(
+    () => pages.find((p) => p.page === currentPage)?.text ?? '',
+    [pages, currentPage]
+  )
 
   return {
     currentPageText,
-    isLoading,
+    isLoading: false,
   }
 }

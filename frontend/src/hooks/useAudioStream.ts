@@ -1,13 +1,14 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-
-interface WordTiming {
-  word: string
-  start: number
-  duration: number
-}
+import { ttsService } from '../services/ttsService'
+import {
+  calculateWordTimings,
+  extractWords,
+  planNarration,
+  type NarrationPlan,
+  type WordTiming,
+} from '../services/narration'
 
 interface UseAudioStreamProps {
-  bookId: string
   currentPage: number
   pageText: string
   speed: number
@@ -19,7 +20,6 @@ interface UseAudioStreamProps {
 
 interface UseAudioStreamReturn {
   isPlaying: boolean
-  isConnected: boolean
   currentTime: number
   currentSentence: number
   totalSentences: number
@@ -32,8 +32,22 @@ interface UseAudioStreamReturn {
   error: string | null
 }
 
+// A generated sentence waiting to be played
+interface QueuedSentence {
+  buffer: AudioBuffer
+  sentenceIndex: number
+  wordOffset: number  // Index of the sentence's first word in the page's word list
+  timings: WordTiming[]
+}
+
+// Buffering: wait for N generated sentences before starting playback
+const MIN_BUFFER_CHUNKS = 2
+
+/**
+ * Reads a page aloud. Sentences are generated on this device by the speech worker
+ * and played back to back with the Web Audio API, highlighting the current word.
+ */
 export function useAudioStream({
-  bookId,
   currentPage,
   pageText,
   speed,
@@ -43,7 +57,6 @@ export function useAudioStream({
   onWordUpdate,
 }: UseAudioStreamProps): UseAudioStreamReturn {
   const [isPlaying, setIsPlaying] = useState(false)
-  const [isConnected, setIsConnected] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [currentSentence, setCurrentSentence] = useState(0)
@@ -51,244 +64,196 @@ export function useAudioStream({
   const [isBuffering, setIsBuffering] = useState(false)
   const [currentWordIndex, setCurrentWordIndex] = useState(0)
   const [allWords, setAllWords] = useState<string[]>([])
-  
-  // Word timing tracking
-  const wordTimingsRef = useRef<WordTiming[]>([])
-  const sentenceWordOffsetsRef = useRef<number[]>([])  // Track word offset for each sentence
-  const currentSentenceStartTimeRef = useRef<number>(0)
 
-  const wsRef = useRef<WebSocket | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
-  const audioBuffersRef = useRef<AudioBuffer[]>([])
-  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null)
   const gainNodeRef = useRef<GainNode | null>(null)
-  const startTimeRef = useRef<number>(0)
-  const pauseTimeRef = useRef<number>(0)
-  const animationFrameRef = useRef<number>(0)
-  const sentenceCountRef = useRef<number>(0)
-  // Ref mirror of isPlaying so WebSocket/async closures always see the current value
-  const isPlayingRef = useRef<boolean>(false)
-  // Buffering: wait for N chunks before starting playback
-  const MIN_BUFFER_CHUNKS = 2
-  const hasStartedPlaybackRef = useRef<boolean>(false)
-  // Track when server has finished streaming all chunks for this page
-  const streamingCompletedRef = useRef<boolean>(false)
+  const volumeRef = useRef(volume)
+  // Incrementing the session cancels sentences that are still being generated
+  const sessionRef = useRef(0)
+  const queueRef = useRef<QueuedSentence[]>([])
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null)
+  const currentItemRef = useRef<QueuedSentence | null>(null)
+  // AudioContext time when the current sentence started playing
+  const itemStartTimeRef = useRef(0)
+  // Seconds of audio fully played on this page
+  const playedSecondsRef = useRef(0)
+  // Ref mirror of isPlaying so async callbacks always see the current value
+  const isPlayingRef = useRef(false)
+  const hasStartedPlaybackRef = useRef(false)
+  // Every sentence of the page has been generated
+  const generationDoneRef = useRef(false)
+  const wordsRef = useRef<string[]>([])
+  const wordIndexRef = useRef(-1)
+  const animationFrameRef = useRef(0)
 
-  // Keep isPlayingRef in sync with state
+  // Audio events fire later, so they read the latest callbacks from refs
+  const onPageCompleteRef = useRef(onPageComplete)
+  const onWordUpdateRef = useRef(onWordUpdate)
   useEffect(() => {
-    isPlayingRef.current = isPlaying
-  }, [isPlaying])
+    onPageCompleteRef.current = onPageComplete
+    onWordUpdateRef.current = onWordUpdate
+  }, [onPageComplete, onWordUpdate])
 
   // Lazily create the AudioContext on first play (browser autoplay policy requires a user gesture)
   const ensureAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
-      audioContextRef.current = new AudioContext()
-      gainNodeRef.current = audioContextRef.current.createGain()
-      gainNodeRef.current.gain.value = volume / 100
-      gainNodeRef.current.connect(audioContextRef.current.destination)
+      const context = new AudioContext()
+      const gain = context.createGain()
+      gain.gain.value = volumeRef.current / 100
+      gain.connect(context.destination)
+      audioContextRef.current = context
+      gainNodeRef.current = gain
     }
     if (audioContextRef.current.state === 'suspended') {
-      audioContextRef.current.resume()
+      void audioContextRef.current.resume()
     }
-  }, [volume])
+  }, [])
 
   useEffect(() => {
     return () => {
-      audioContextRef.current?.close()
+      void audioContextRef.current?.close()
+      audioContextRef.current = null
+      gainNodeRef.current = null
     }
   }, [])
 
   // Update gain whenever volume changes
   useEffect(() => {
+    volumeRef.current = volume
     if (gainNodeRef.current) {
       gainNodeRef.current.gain.value = volume / 100
     }
   }, [volume])
 
-  // Stop all audio and clear buffers
-  const stopAudio = useCallback(() => {
-    if (currentSourceRef.current) {
+  // Stop the playing sentence without running its "ended" handler
+  const stopSource = useCallback(() => {
+    const source = currentSourceRef.current
+    currentSourceRef.current = null
+    currentItemRef.current = null
+    if (source) {
+      source.onended = null
       try {
-        currentSourceRef.current.stop()
+        source.stop()
       } catch {
         // Already stopped
       }
-      currentSourceRef.current = null
     }
-    audioBuffersRef.current = []
-    hasStartedPlaybackRef.current = false  // Reset buffering state
-    streamingCompletedRef.current = false  // Reset completion tracking
-    setIsBuffering(false)
-    setCurrentTime(0)
-    pauseTimeRef.current = 0
   }, [])
 
-  // Play the next decoded buffer from the queue
-  const playNextBuffer = useCallback(() => {
-    if (!audioContextRef.current || !gainNodeRef.current) return
-    if (audioBuffersRef.current.length === 0) return
+  // Stop all audio and clear buffers
+  const stopAudio = useCallback(() => {
+    stopSource()
+    queueRef.current = []
+    hasStartedPlaybackRef.current = false
+    generationDoneRef.current = false
+    playedSecondsRef.current = 0
+    setIsBuffering(false)
+    setCurrentTime(0)
+  }, [stopSource])
 
-    const audioBuffer = audioBuffersRef.current.shift()!
-    const source = audioContextRef.current.createBufferSource()
-    source.buffer = audioBuffer
-    source.connect(gainNodeRef.current)
+  // All sentences of the page have played
+  const finishPage = useCallback(() => {
+    console.log('🎉 Page playback completed — triggering onPageComplete')
+    isPlayingRef.current = false
+    setIsPlaying(false)
+    setIsBuffering(false)
+    setCurrentTime(0)
+    onPageCompleteRef.current?.()
+  }, [])
 
-    // Track the start time for word highlighting
-    const bufferStartTime = audioContextRef.current.currentTime
-    currentSentenceStartTimeRef.current = bufferStartTime
+  // Play the next generated sentence if possible, or finish the page when nothing is left
+  const advance = useCallback(
+    function advance() {
+      const context = audioContextRef.current
+      const gain = gainNodeRef.current
+      if (!isPlayingRef.current || currentSourceRef.current || !context || !gain) return
 
-    source.onended = () => {
-      currentSourceRef.current = null
-      if (audioBuffersRef.current.length > 0 && isPlayingRef.current) {
-        // More buffers in queue, play next
-        playNextBuffer()
-      } else if (streamingCompletedRef.current && audioBuffersRef.current.length === 0) {
-        // All done: server finished streaming AND all buffers played
-        console.log('🎉 Page playback completed — triggering onPageComplete')
-        setIsPlaying(false)
-        isPlayingRef.current = false
-        setCurrentTime(0)
-        streamingCompletedRef.current = false  // Reset for next page
-        // Trigger callback to advance to next page
-        if (onPageComplete) {
-          onPageComplete()
+      const queued = queueRef.current.length
+      const done = generationDoneRef.current
+      const canStart = hasStartedPlaybackRef.current || queued >= MIN_BUFFER_CHUNKS || done
+
+      if (queued > 0 && canStart) {
+        const item = queueRef.current.shift()!
+        const source = context.createBufferSource()
+        source.buffer = item.buffer
+        source.connect(gain)
+        source.onended = () => {
+          if (currentSourceRef.current !== source) return
+          currentSourceRef.current = null
+          currentItemRef.current = null
+          playedSecondsRef.current += item.buffer.duration
+          advance()
         }
-      } else if (isPlayingRef.current) {
-        // Queue empty but streaming might still be in progress — wait for more chunks
-      } else {
-        // Stopped manually
-        setIsPlaying(false)
-        setCurrentTime(0)
-      }
-    }
 
-    source.start()
-    currentSourceRef.current = source
-    startTimeRef.current = audioContextRef.current.currentTime
-  }, [onPageComplete])
-
-  // Handle a raw WAV ArrayBuffer arriving from the WebSocket
-  const handleAudioData = useCallback(async (arrayBuffer: ArrayBuffer) => {
-    if (!audioContextRef.current) return
-
-    try {
-      // slice(0) copies the buffer so decodeAudioData can own it
-      const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0))
-      audioBuffersRef.current.push(audioBuffer)
-
-      console.log(`📦 Buffered chunk ${audioBuffersRef.current.length} (started: ${hasStartedPlaybackRef.current})`)
-
-      // Wait for MIN_BUFFER_CHUNKS before starting playback the first time
-      if (isPlayingRef.current && !currentSourceRef.current && !hasStartedPlaybackRef.current) {
-        if (audioBuffersRef.current.length >= MIN_BUFFER_CHUNKS) {
-          console.log(`🎬 Starting playback with ${audioBuffersRef.current.length} buffered chunks`)
+        if (!hasStartedPlaybackRef.current) {
+          console.log(`🎬 Starting playback with ${queued} buffered sentence(s)`)
           hasStartedPlaybackRef.current = true
-          setIsBuffering(false)
-          playNextBuffer()
-        } else {
-          console.log(`⏳ Waiting for ${MIN_BUFFER_CHUNKS - audioBuffersRef.current.length} more chunks before starting...`)
-          setIsBuffering(true)
         }
-      } else if (isPlayingRef.current && hasStartedPlaybackRef.current && !currentSourceRef.current) {
-        // Already started, just resume immediately
-        playNextBuffer()
-      }
-    } catch (err) {
-      console.error('Error decoding audio chunk:', err)
-      setIsBuffering(false)
-    }
-  }, [playNextBuffer])
-
-  // Connect (or reuse) the WebSocket
-  const connectWebSocket = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return
-
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const ws = new WebSocket(`${protocol}//${window.location.hostname}:8000/api/tts/stream`)
-    ws.binaryType = 'arraybuffer'
-
-    ws.onopen = () => {
-      console.log('WebSocket connected')
-      setIsConnected(true)
-      setError(null)
-    }
-
-    ws.onmessage = async (event) => {
-      if (typeof event.data === 'string') {
-        const message = JSON.parse(event.data)
-        if (message.error) {
-          setError(message.error)
-          setIsPlaying(false)
-          isPlayingRef.current = false
-        } else if (message.type === 'timing') {
-          // Received word timing information for a sentence
-          const words = message.words || []
-          const timings = message.word_timings || []
-          const sentenceIndex = message.sentence_index || 0
-          
-          console.log(`📝 Received timing for sentence ${sentenceIndex + 1}:`, {
-            words: words,
-            wordCount: words.length,
-            timings: timings.length
-          })
-          
-          // Store word offset for this sentence
-          const wordOffset = wordTimingsRef.current.length
-          sentenceWordOffsetsRef.current[sentenceIndex] = wordOffset
-          
-          // Append words and timings
-          setAllWords(prev => {
-            const updated = [...prev, ...words]
-            console.log(`📚 Total words now: ${updated.length}`)
-            return updated
-          })
-          wordTimingsRef.current.push(...timings)
-          
-          console.log(`⏱️  Word timings stored:`, timings.slice(0, 3))  // Log first 3 for debugging
-          
-        } else if (message.type === 'single_chunk_page') {
-          // Server detected page has only one chunk - skip to next page
-          console.log('⏭️  Page has only one chunk - auto-advancing to next page')
-          setIsPlaying(false)
-          isPlayingRef.current = false
-          streamingCompletedRef.current = false
-          // Trigger page advance
-          if (onPageComplete) {
-            onPageComplete()
-          }
-        } else if (message.status === 'completed') {
-          console.log('Audio streaming completed — draining remaining buffers')
-          streamingCompletedRef.current = true
-          // Don't touch isPlaying; let playNextBuffer drain the queue and trigger onPageComplete
-        } else if (message.status === 'paused') {
-          setIsPlaying(false)
-          isPlayingRef.current = false
-        } else if (message.status === 'stopped') {
-          setIsPlaying(false)
-          isPlayingRef.current = false
-          stopAudio()
-        }
+        source.start()
+        currentSourceRef.current = source
+        currentItemRef.current = item
+        itemStartTimeRef.current = context.currentTime
+        setCurrentSentence(item.sentenceIndex + 1)
+        setIsBuffering(false)
+      } else if (queued === 0 && done) {
+        finishPage()
       } else {
-        // Binary audio chunk
-        sentenceCountRef.current += 1
-        setCurrentSentence(sentenceCountRef.current)
-        await handleAudioData(event.data as ArrayBuffer)
+        // Waiting for the next sentence to be generated
+        setIsBuffering(true)
       }
-    }
+    },
+    [finishPage]
+  )
 
-    ws.onerror = (err) => {
-      console.error('WebSocket error:', err)
-      setError('Connection error')
-      setIsConnected(false)
-    }
+  // Generate the page's sentences one at a time and queue them for playback
+  const generateSentences = useCallback(
+    async (session: number, plan: NarrationPlan, narrationSpeed: number) => {
+      const isCurrentSession = () => sessionRef.current === session
+      const lastIndex = plan.sentences.length - 1
 
-    ws.onclose = () => {
-      console.log('WebSocket closed')
-      setIsConnected(false)
-    }
+      for (let i = plan.startIndex; i <= lastIndex; i++) {
+        const sentence = plan.sentences[i]
+        const startedAt = performance.now()
+        try {
+          const { samples, sampleRate } = await ttsService.generate(sentence, narrationSpeed)
+          const context = audioContextRef.current
+          if (!isCurrentSession() || !context) return
 
-    wsRef.current = ws
-  }, [handleAudioData, stopAudio])
+          const buffer = context.createBuffer(1, Math.max(1, samples.length), sampleRate)
+          buffer.getChannelData(0).set(samples)
+          queueRef.current.push({
+            buffer,
+            sentenceIndex: i,
+            wordOffset: plan.wordOffsets[i],
+            timings: calculateWordTimings(extractWords(sentence), buffer.duration),
+          })
+          const seconds = (performance.now() - startedAt) / 1000
+          console.log(
+            `🎤 Sentence ${i + 1}/${plan.sentences.length}: ${buffer.duration.toFixed(1)}s of audio in ${seconds.toFixed(1)}s`
+          )
+        } catch (err) {
+          if (!isCurrentSession()) return
+          const message = err instanceof Error ? err.message : String(err)
+          if (ttsService.getState().status === 'error') {
+            console.error('Voice model error:', err)
+            setError(`Could not load the voice model: ${message}`)
+            isPlayingRef.current = false
+            setIsPlaying(false)
+            setIsBuffering(false)
+            return
+          }
+          // Skip a sentence the model cannot read and keep going
+          console.warn(`⚠️  Skipping sentence ${i + 1}: ${message}`)
+        }
+
+        if (i === lastIndex) {
+          generationDoneRef.current = true
+        }
+        advance()
+      }
+    },
+    [advance]
+  )
 
   // Play
   const play = useCallback((startPos: number = 0) => {
@@ -300,78 +265,48 @@ export function useAudioStream({
     // Must call inside a user-gesture handler — this is triggered by a button click
     ensureAudioContext()
 
-    const sentences = pageText.split(/[.!?]+/).filter(s => s.trim().length > 0)
-    setTotalSentences(sentences.length)
-    sentenceCountRef.current = 0
-    setCurrentSentence(0)
-    
-    // Reset word tracking
-    setAllWords([])
+    // Cancel whatever is still playing or being generated
+    const session = ++sessionRef.current
+    stopAudio()
+
+    const plan = planNarration(pageText, startPos)
+    setError(null)
+    setTotalSentences(plan.sentences.length)
+    setCurrentSentence(plan.startIndex)
+    wordsRef.current = plan.words
+    wordIndexRef.current = -1
+    setAllWords(plan.words)
     setCurrentWordIndex(0)
-    wordTimingsRef.current = []
-    sentenceWordOffsetsRef.current = []
 
-    connectWebSocket()
+    if (plan.skipPage) {
+      // Only one short chunk on this page (a title, a page number...) - move to the next page
+      console.log(`⏭️  Skipping page ${currentPage}: single_chunk_page`)
+      isPlayingRef.current = false
+      setIsPlaying(false)
+      onPageCompleteRef.current?.()
+      return
+    }
 
-    const checkConnection = setInterval(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        clearInterval(checkConnection)
-
-        stopAudio() // clear leftovers from previous play
-
-        // Reset completion tracking for new page
-        streamingCompletedRef.current = false
-
-        // Set playing BEFORE sending — so the first chunk triggers playback
-        setIsPlaying(true)
-        isPlayingRef.current = true
-
-        wsRef.current.send(
-          JSON.stringify({
-            action: 'start',
-            book_id: bookId,
-            page_number: currentPage,
-            speed: speed,
-            text: pageText,
-            start_position: startPos,  // Add start position
-          })
-        )
-
-        setError(null)
-      }
-    }, 100)
-
-    setTimeout(() => {
-      clearInterval(checkConnection)
-      if (wsRef.current?.readyState !== WebSocket.OPEN) {
-        setError('Failed to connect to server')
-      }
-    }, 5000)
-  }, [bookId, currentPage, pageText, speed, connectWebSocket, ensureAudioContext, stopAudio])
+    console.log(`📖 Reading page ${currentPage} from sentence ${plan.startIndex + 1}/${plan.sentences.length}`)
+    // Set playing BEFORE generating — so the first sentences start playback
+    isPlayingRef.current = true
+    setIsPlaying(true)
+    setIsBuffering(true)
+    void generateSentences(session, plan, speed)
+  }, [pageText, speed, currentPage, ensureAudioContext, stopAudio, generateSentences])
 
   // Pause
   const pause = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ action: 'pause' }))
-    }
-
+    sessionRef.current++  // Stop generating more sentences
     isPlayingRef.current = false
-
-    if (currentSourceRef.current && audioContextRef.current) {
-      try { currentSourceRef.current.stop() } catch { /* already stopped */ }
-      currentSourceRef.current = null
-      pauseTimeRef.current = audioContextRef.current.currentTime - startTimeRef.current
-    }
-
+    stopSource()
     setIsPlaying(false)
-  }, [])
+    setIsBuffering(false)
+  }, [stopSource])
 
   // Stop
   const stop = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ action: 'stop' }))
-    }
-
+    sessionRef.current++
     isPlayingRef.current = false
     stopAudio()
     setIsPlaying(false)
@@ -379,58 +314,47 @@ export function useAudioStream({
 
   // Animate the elapsed-time counter and word highlighting
   useEffect(() => {
-    if (!isPlaying || !audioContextRef.current) return
+    if (!isPlaying) return
 
-    const updateTime = () => {
-      if (audioContextRef.current && startTimeRef.current > 0) {
-        const elapsed = audioContextRef.current.currentTime - startTimeRef.current
-        setCurrentTime(elapsed)
-        
-        // Update current word based on timings
-        if (wordTimingsRef.current.length > 0) {
-          const currentSentenceIdx = sentenceCountRef.current - 1
-          
-          if (currentSentenceIdx >= 0 && sentenceWordOffsetsRef.current[currentSentenceIdx] !== undefined) {
-            const wordOffset = sentenceWordOffsetsRef.current[currentSentenceIdx]
-            const sentenceTimings = wordTimingsRef.current.slice(
-              wordOffset,
-              sentenceWordOffsetsRef.current[currentSentenceIdx + 1] || wordTimingsRef.current.length
-            )
-            
-            // Calculate time since this sentence started
-            const sentenceStartTime = currentSentenceStartTimeRef.current
-            const timeSinceSentenceStart = audioContextRef.current.currentTime - sentenceStartTime
-            
-            // Find which word in THIS sentence we're on
-            for (let i = 0; i < sentenceTimings.length; i++) {
-              const timing = sentenceTimings[i]
-              if (timing.start <= timeSinceSentenceStart && timeSinceSentenceStart < timing.start + timing.duration) {
-                const globalWordIndex = wordOffset + i
-                if (currentWordIndex !== globalWordIndex) {
-                  console.log(`🎯 Word ${globalWordIndex}: "${timing.word}" at ${timeSinceSentenceStart.toFixed(2)}s`)
-                  setCurrentWordIndex(globalWordIndex)
-                  if (onWordUpdate) {
-                    onWordUpdate(globalWordIndex, allWords)
-                  }
-                }
-                break
-              }
-            }
+    let shownSecond = -1
+    const update = () => {
+      const context = audioContextRef.current
+      const item = currentItemRef.current
+      if (context && item) {
+        const sentenceTime = Math.min(
+          Math.max(0, context.currentTime - itemStartTimeRef.current),
+          item.buffer.duration
+        )
+        const elapsed = playedSecondsRef.current + sentenceTime
+        if (Math.floor(elapsed) !== shownSecond) {
+          shownSecond = Math.floor(elapsed)
+          setCurrentTime(elapsed)
+        }
+
+        // Find which word of the playing sentence we're on
+        const localIndex = item.timings.findIndex(
+          (timing) => sentenceTime >= timing.start && sentenceTime < timing.start + timing.duration
+        )
+        if (localIndex !== -1) {
+          const wordIndex = item.wordOffset + localIndex
+          if (wordIndex !== wordIndexRef.current) {
+            wordIndexRef.current = wordIndex
+            setCurrentWordIndex(wordIndex)
+            onWordUpdateRef.current?.(wordIndex, wordsRef.current)
           }
         }
       }
-      animationFrameRef.current = requestAnimationFrame(updateTime)
+      animationFrameRef.current = requestAnimationFrame(update)
     }
 
-    animationFrameRef.current = requestAnimationFrame(updateTime)
+    animationFrameRef.current = requestAnimationFrame(update)
     return () => cancelAnimationFrame(animationFrameRef.current)
-  }, [isPlaying, allWords, onWordUpdate, currentWordIndex])
+  }, [isPlaying])
 
   // Clean up on unmount
   useEffect(() => {
     return () => {
       stop()
-      wsRef.current?.close()
     }
   }, [stop])
 
@@ -449,7 +373,6 @@ export function useAudioStream({
 
   return {
     isPlaying,
-    isConnected,
     currentTime,
     currentSentence,
     totalSentences,
